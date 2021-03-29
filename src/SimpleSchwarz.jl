@@ -2,11 +2,11 @@ module SimpleSchwarz
 
 import Printf: @sprintf
 import LightGraphs: Graph, add_edge!, neighbors, nv
-import SimpleNLModels: Model, variable, parameter, constraint, objective,
-    num_variables, num_constraints, func, deriv, optimize!, instantiate!
+import SimpleNL: Model, variable, parameter, constraint, objective, Expression, non_caching_eval, num_variables, num_constraints, optimize!, instantiate!,get_terms, get_entries_expr, sparsity, KKTErrorEvaluator
 import LinearAlgebra: norm
+import Requires: @require
 
-export SchwarzModel, iterate!, optimize!
+default_subproblem_optimizer() = @isdefined(DEFAULT_SUBPROBLEM_OPTIMIZER) ? DEFAULT_SUBPROBLEM_OPTIMIZER : error("DEFAULT_SUBPROBLEM_OPTIMIZER is not defined. To use Ipopt as a default subproblem optimizer, do: using Ipopt")
 
 mutable struct SubModel
     model::Model
@@ -26,55 +26,49 @@ mutable struct SubModel
     x_err_sub
     l_err_sub
     
-    function SubModel(m::Model,V,W,rho;opt...)
-        msub = Model(m.optimizer;m.opt...,opt...)
-        
-
-        V_con = Int[]
-        for i=1:num_constraints(m)
-            minimum(keys(deriv(m.cons[i]))) in V && push!(V_con,i)
-        end
-        
-        W_con = copy(V_con)
-        W_bdry_con = Int[]
+    function SubModel(m::Model,optimizer,V,W,rho,objs,cons,obj_sparsity,con_sparsity;opt...)
+        msub = Model(optimizer;opt...)
 
         W_bool = falses(num_variables(m))
         W_bool[W] .= true
+        V_bool = falses(num_variables(m))
+        V_bool[V] .= true
         
+        V_con = get_V_con(V_bool,con_sparsity)
+        W_con = copy(V_con)
+        W_bdry_con = Int[]
+
         for i in setdiff(1:num_constraints(m),V_con)
-            typ = examine(W_bool,keys(deriv(m.cons[i])))
+            typ = examine(W_bool,con_sparsity[i])
             if typ == 2
                 push!(W_con,i)
             elseif typ == 1
                 push!(W_bdry_con,i)
             end
         end
-            
+
+        W_obj = get_W_obj(objs,obj_sparsity,W_bool)            
         V_compl = setdiff(W,V)
         V_compl_con = setdiff(W_con,V_con)
         W_compl = setdiff(1:num_variables(m),W)
 
-        x = [i in W ? variable(msub;lb=m.xl[i],ub=m.xu[i],start=m.x[i]) : parameter(msub) for i=1:num_variables(m)]
+        x = [W_bool[i] ? variable(msub;lb=m.xl[i],ub=m.xu[i],start=m.x[i]) : parameter(msub) for i=1:num_variables(m)]
         l = Dict(i=>parameter(msub,0.) for i in W_bdry_con)
         
-        for obj in m.objs
-            examine(W_bool,keys(deriv(obj))) >= 1 && objective(msub,func(obj)(x,m.p))
-        end
+        objective(msub,sum(non_caching_eval(objs[i],x,m.p) for i in W_obj; init = 0) +
+                  sum((non_caching_eval(cons[i],x,m.p)-m.gl[i]) * l[i] + 0.5 * rho * (non_caching_eval(cons[i],x,m.p)-m.gl[i])^2 for i in W_bdry_con; init = 0))
+        
 
         for i in W_con
-            constraint(msub,func(m.cons[i])(x,m.p);lb=m.gl[i],ub=m.gu[i])
-        end
-        for i in W_bdry_con
-            objective(msub, (func(m.cons[i])(x,m.p)-m.gl[i]) * l[i] + 0.5 * rho * (func(m.cons[i])(x,m.p)-m.gl[i])^2 )
+            constraint(msub,non_caching_eval(cons[i],x,m.p);lb=m.gl[i],ub=m.gu[i])
         end
 
         instantiate!(msub)
 
-        
         x_V_orig = view(m.x,V)
         l_V_orig = view(m.l,V_con)
-        x_V_sub = view(msub.x,[i for i in eachindex(W) if W[i] in V])
-        l_V_sub = view(msub.l,[i for i in eachindex(W_con) if W_con[i] in V_con])
+        x_V_sub = view(msub.x,Base._findin(W,V))
+        l_V_sub = view(msub.l,Base._findin(W_con,V_con))
 
         x_bdry_orig= view(m.x,W_compl) 
         l_bdry_orig= view(m.l,W_bdry_con)
@@ -83,11 +77,9 @@ mutable struct SubModel
 
         x_err_orig = view(m.x,V_compl)
         l_err_orig = view(m.l,V_compl_con)
-        x_err_sub = view(msub.x,[i for i in eachindex(W) if W[i] in V_compl])
-        l_err_sub = view(msub.l,[i for i in eachindex(W_con) if W_con[i] in V_compl_con])
+        x_err_sub = view(msub.x,Base._findin(W,V_compl))
+        l_err_sub = view(msub.l,Base._findin(W_con,V_compl_con))
 
-
-        
         return new(msub,
                    x_V_orig,l_V_orig,x_V_sub,l_V_sub,
                    x_bdry_orig,l_bdry_orig,x_bdry_sub,l_bdry_sub,
@@ -95,42 +87,63 @@ mutable struct SubModel
     end
 end
 
-mutable struct SchwarzModel
-    model::Model
-    submodels::Vector{SubModel}
-    rho::Float64
+function get_V_con(V_bool,con_sparsity)
+    V_con = Int[]
+    for i=1:length(con_sparsity)
+        V_bool[minimum(con_sparsity[i])] && push!(V_con,i)
+    end
+    return V_con
 end
 
+get_W_obj(objs,obj_sparsity,W_bool) = [i for i in eachindex(objs) if examine(W_bool,obj_sparsity[i]) >= 1]
 
-function instantiate!(schwarz::SchwarzModel)
+mutable struct Optimizer
+    model::Model
+    submodels::Vector{SubModel}
+    kkt_error_evaluator
+    opt::Dict{Symbol,Any}
+end
+
+default_option() = Dict(
+    :rho=>1.,
+    :omega=>1.,
+    :maxiter=>400,
+    :tol=>1e-6,
+    :subproblem_optimizer=>default_subproblem_optimizer(),
+    :subproblem_option=>Dict(:print_level=>0),
+    :save_output=>false,
+    :optional=>schwarz->nothing
+)
+
+function instantiate!(schwarz::Optimizer)
     Threads.@threads for sm in schwarz.submodels
         instantiate!(sm)
     end
 end
-function iterate!(schwarz::SchwarzModel;err=Threads.Atomic{Float64}(Inf))
-    Threads.@threads for sm in schwarz.submodels
-        set_submodel!(sm)
-    end
-    Threads.@threads for sm in schwarz.submodels
-        optimize!(sm)
-    end
-    Threads.@threads for sm in schwarz.submodels
-        set_orig!(sm)
-    end
-    Threads.@threads for sm in schwarz.submodels
-        set_err!(sm,err)
-    end
-end
-function optimize!(schwarz::SchwarzModel;tol = 1e-8, maxiter = 100,optional = schwarz->nothing)
-    err=Threads.Atomic{Float64}(Inf)
 
-    iter = 0
-    while err[] > tol && iter < maxiter
-        err[] = .0
-        iterate!(schwarz;err=err)
-        println(@sprintf "%4i %4.2e" iter+=1 err[])
-        optional(schwarz)
+function optimize!(schwarz::Optimizer)
+    save_output = schwarz.opt[:save_output]
+    if save_output
+        output = Tuple{Float64,Float64}[]
+        start = time()
     end
+    
+    iter = 0
+    while (err=schwarz.kkt_error_evaluator(schwarz.model.x,schwarz.model.l,schwarz.model.gl)) > schwarz.opt[:tol] && iter < schwarz.opt[:maxiter]
+        Threads.@threads for sm in schwarz.submodels
+            set_submodel!(sm)
+        end
+        Threads.@threads for sm in schwarz.submodels
+            optimize!(sm)
+        end
+        Threads.@threads for sm in schwarz.submodels
+            set_orig!(sm)
+        end
+        println(@sprintf "%4i %4.2e" iter+=1 err)
+        save_output && push!(output,(err,time()-start))
+    end
+    save_output && (schwarz.model.ext[:output]=output)
+    schwarz.opt[:optional](schwarz)
 end
 
 function set_err!(sm,err)
@@ -165,25 +178,35 @@ function examine(W_bool,keys)
     end
     return numtrue == 0 ? 0 : numtrue == length(keys) ? 2 : 1
 end
-is_included(expr,W) = issubset(keys(deriv(expr)),W)
-is_adjacent(expr,W) = !isdisjoint(keys(deriv(expr)),W)
+
 optimize!(sm::SubModel) = optimize!(sm.model)
 instantiate!(sm::SubModel) = instantiate!(sm.model)
-function SchwarzModel(m::Model;rho=1.,omega=.1,opt...)
 
-    m[:Ws]=expand(m,m[:Vs],omega)
+function Optimizer(m::Model)
+    opt = default_option()
+    for (sym,val) in m.opt
+        opt[sym] = val
+    end
+    
+    objs = get_terms(m.obj)
+    cons = get_entries_expr(m.con)
+    obj_sparsity = [sparsity(e) for e in objs]
+    con_sparsity = [sparsity(e) for e in cons]
+    
+    m[:Ws]=expand(num_variables(m),con_sparsity,m[:Vs],opt[:omega])
+
     sms = Vector{SubModel}(undef,length(m[:Vs]))
     
     Threads.@threads for i in collect(keys(m[:Vs]))
-        sms[i] = SubModel(m,m[:Vs][i],m[:Ws][i],rho;opt...)
+        sms[i] = SubModel(m,opt[:subproblem_optimizer],m[:Vs][i],m[:Ws][i],opt[:rho],objs,cons,obj_sparsity,con_sparsity;opt[:subproblem_option]...)
     end
-    
-    SchwarzModel(m,sms,rho)
+
+    Optimizer(m,sms,KKTErrorEvaluator(m),opt)
 end
 
-function expand(m,Vs,omega)
+function expand(n,con_sparsity,Vs,omega)
     
-    g = Graph(m)
+    g = Graph(n,con_sparsity)
     Ws = Dict(k=>copy(V) for (k,V) in Vs)
     
     Threads.@threads for k in collect(keys(Ws))
@@ -224,16 +247,27 @@ function expand!(V_om,g::Graph,max_size;
     return new_nbr
 end
 
-function Graph(m::Model)
-    g = Graph(num_variables(m))
-    for con in m.cons
-        for i in keys(deriv(con))
-            for j in keys(deriv(con))
-                i>j && add_edge!(g,i,j)
-            end
-        end
+function Graph(n::Int,con_sparsity::Vector{Vector{Int}})
+    g = Graph(n)
+    for sp in con_sparsity
+        _graph!(g,sp)
     end
     return g
+end
+
+function _graph!(g,sp)
+    for i in sp
+        for j in sp
+            i>j && add_edge!(g,i,j)
+        end
+    end
+end
+
+function __init__()
+    @require Ipopt="b6b21f68-93f8-5de0-b562-5493be1d77c9" @eval begin
+        import ..Ipopt
+        DEFAULT_SUBPROBLEM_OPTIMIZER = Ipopt.Optimizer
+    end
 end
 
 end # module

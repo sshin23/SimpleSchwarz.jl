@@ -4,10 +4,14 @@ authors = ["Sungho Shin"]
 version = "0.1.0"
 
 [deps]
-SimpleNLModels = "f0d6f1f6-17c6-46e2-b3a9-6ef89a8ca0c6"
+SimpleNL = "7bbef9ca-9061-49de-8b0e-60c2db5b3b29"
 LightGraphs = "093fc24a-ae57-5d10-9952-331d41423f4d"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Requires = "ae029012-a4dd-5104-9daa-d747884805df"
 
 [compat]
-julia = "1"
+LightGraphs = "1.3"
+SimpleNL = "0.1"
+Requires = "1"
+julia = "1.6"
