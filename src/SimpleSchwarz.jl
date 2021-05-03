@@ -15,12 +15,15 @@ mutable struct SubModel
     l_V_orig
     x_V_sub
     l_V_sub
+
+    x_final_orig
+    x_final_sub
     
     x_bdry_orig
     l_bdry_orig
     x_bdry_sub
     l_bdry_sub
-
+    
     x_err_orig
     l_err_orig
     x_err_sub
@@ -28,7 +31,6 @@ mutable struct SubModel
     
     function SubModel(m::Model,V,W,rho;opt...)
         msub = Model(m.optimizer;m.opt...,opt...)
-        
 
         V_con = Int[]
         for i=1:num_constraints(m)
@@ -46,16 +48,20 @@ mutable struct SubModel
             if typ == 2
                 push!(W_con,i)
             elseif typ == 1
-                push!(W_bdry_con,i)
+                i <= V_con[1] ? push!(W_con,i) : push!(W_bdry_con,i)
             end
         end
-            
+        
         V_compl = setdiff(W,V)
         V_compl_con = setdiff(W_con,V_con)
         W_compl = setdiff(1:num_variables(m),W)
 
+        p = length(m[:x0])
+        W_final = W[end] == num_variables(m) ? [] : W[end-p+1:end]
+
         x = [i in W ? variable(msub;lb=m.xl[i],ub=m.xu[i],start=m.x[i]) : parameter(msub) for i=1:num_variables(m)]
         l = Dict(i=>parameter(msub,0.) for i in W_bdry_con)
+        xf= Dict(i=>parameter(msub,0.) for i in W_final)
         
         for obj in m.objs
             examine(W_bool,keys(deriv(obj))) >= 1 && objective(msub,func(obj)(x,m.p))
@@ -65,7 +71,10 @@ mutable struct SubModel
             constraint(msub,func(m.cons[i])(x,m.p);lb=m.gl[i],ub=m.gu[i])
         end
         for i in W_bdry_con
-            objective(msub, (func(m.cons[i])(x,m.p)-m.gl[i]) * l[i] + 0.5 * rho * (func(m.cons[i])(x,m.p)-m.gl[i])^2 )
+            objective(msub, (func(m.cons[i])(x,m.p)-m.gl[i]) * l[i])
+        end
+        for i in W_final
+            objective(msub, rho*(x[i]-xf[i])^2)
         end
 
         instantiate!(msub)
@@ -76,24 +85,112 @@ mutable struct SubModel
         x_V_sub = view(msub.x,[i for i in eachindex(W) if W[i] in V])
         l_V_sub = view(msub.l,[i for i in eachindex(W_con) if W_con[i] in V_con])
 
+        x_final_orig = view(m.x,W_final)
+        x_final_sub = view(msub.p,length(W_compl)+length(W_bdry_con)+1:length(W_compl)+length(W_bdry_con)+length(W_final))
+        
         x_bdry_orig= view(m.x,W_compl) 
         l_bdry_orig= view(m.l,W_bdry_con)
         x_bdry_sub = view(msub.p,1:length(W_compl))
         l_bdry_sub = view(msub.p,length(W_compl)+1:length(W_compl)+length(W_bdry_con))
-
+        
         x_err_orig = view(m.x,V_compl)
         l_err_orig = view(m.l,V_compl_con)
         x_err_sub = view(msub.x,[i for i in eachindex(W) if W[i] in V_compl])
         l_err_sub = view(msub.l,[i for i in eachindex(W_con) if W_con[i] in V_compl_con])
 
-
-        
         return new(msub,
-                   x_V_orig,l_V_orig,x_V_sub,l_V_sub,
+                   x_V_orig,l_V_orig,x_V_sub,l_V_sub,x_final_orig,x_final_sub,
                    x_bdry_orig,l_bdry_orig,x_bdry_sub,l_bdry_sub,
                    x_err_orig,l_err_orig,x_err_sub,l_err_sub)
     end
 end
+
+# mutable struct SubModel
+#     model::Model
+    
+#     x_V_orig
+#     l_V_orig
+#     x_V_sub
+#     l_V_sub
+    
+#     x_bdry_orig
+#     l_bdry_orig
+#     x_bdry_sub
+#     l_bdry_sub
+
+#     x_err_orig
+#     l_err_orig
+#     x_err_sub
+#     l_err_sub
+    
+#     function SubModel(m::Model,V,W,rho;opt...)
+#         msub = Model(m.optimizer;m.opt...,opt...)
+        
+
+#         V_con = Int[]
+#         for i=1:num_constraints(m)
+#             minimum(keys(deriv(m.cons[i]))) in V && push!(V_con,i)
+#         end
+        
+#         W_con = copy(V_con)
+#         W_bdry_con = Int[]
+
+#         W_bool = falses(num_variables(m))
+#         W_bool[W] .= true
+        
+#         for i in setdiff(1:num_constraints(m),V_con)
+#             typ = examine(W_bool,keys(deriv(m.cons[i])))
+#             if typ == 2
+#                 push!(W_con,i)
+#             elseif typ == 1
+#                 push!(W_bdry_con,i)
+#             end
+#         end
+            
+#         V_compl = setdiff(W,V)
+#         V_compl_con = setdiff(W_con,V_con)
+#         W_compl = setdiff(1:num_variables(m),W)
+
+#         x = [i in W ? variable(msub;lb=m.xl[i],ub=m.xu[i],start=m.x[i]) : parameter(msub) for i=1:num_variables(m)]
+#         l = Dict(i=>parameter(msub,0.) for i in W_bdry_con)
+        
+#         for obj in m.objs
+#             examine(W_bool,keys(deriv(obj))) >= 1 && objective(msub,func(obj)(x,m.p))
+#         end
+
+#         for i in W_con
+#             constraint(msub,func(m.cons[i])(x,m.p);lb=m.gl[i],ub=m.gu[i])
+#         end
+#         for i in W_bdry_con
+#             objective(msub, (func(m.cons[i])(x,m.p)-m.gl[i]) * l[i] + 0.5 * rho * (func(m.cons[i])(x,m.p)-m.gl[i])^2 )
+#         end
+
+#         instantiate!(msub)
+
+        
+#         x_V_orig = view(m.x,V)
+#         l_V_orig = view(m.l,V_con)
+#         x_V_sub = view(msub.x,[i for i in eachindex(W) if W[i] in V])
+#         l_V_sub = view(msub.l,[i for i in eachindex(W_con) if W_con[i] in V_con])
+
+#         x_bdry_orig= view(m.x,W_compl) 
+#         l_bdry_orig= view(m.l,W_bdry_con)
+#         x_bdry_sub = view(msub.p,1:length(W_compl))
+#         l_bdry_sub = view(msub.p,length(W_compl)+1:length(W_compl)+length(W_bdry_con))
+
+#         x_err_orig = view(m.x,V_compl)
+#         l_err_orig = view(m.l,V_compl_con)
+#         x_err_sub = view(msub.x,[i for i in eachindex(W) if W[i] in V_compl])
+#         l_err_sub = view(msub.l,[i for i in eachindex(W_con) if W_con[i] in V_compl_con])
+
+
+        
+#         return new(msub,
+#                    x_V_orig,l_V_orig,x_V_sub,l_V_sub,
+#                    x_bdry_orig,l_bdry_orig,x_bdry_sub,l_bdry_sub,
+#                    x_err_orig,l_err_orig,x_err_sub,l_err_sub)
+#     end
+# end
 
 mutable struct SchwarzModel
     model::Model
@@ -149,6 +246,8 @@ end
 function set_submodel!(sm)
     sm.x_bdry_sub .= sm.x_bdry_orig
     sm.l_bdry_sub .= sm.l_bdry_orig
+    sm.x_final_sub .= sm.x_final_orig
+
     nothing
 end
 
